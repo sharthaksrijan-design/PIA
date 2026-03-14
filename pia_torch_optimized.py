@@ -754,10 +754,13 @@ class PIAModel(nn.Module):
     def compute_loss(self, ids: Tensor,
                      states: Optional[State] = None
                      ) -> Tuple[Tensor, Tensor, State]:
-        logits, new_states = self.forward(ids, states)
+        # ids: (B, L+1). We use first L for input, last L for target.
+        # This ensures the state at the end of the chunk is perfectly aligned
+        # with the start of the next chunk in stateful training.
+        logits, new_states = self.forward(ids[:, :-1], states)
         B, L, V = logits.shape
         ce    = F.cross_entropy(
-            logits[:, :-1].reshape(-1, V),
+            logits.reshape(-1, V),
             ids[:, 1:].reshape(-1).long(),
         )
         orth  = (self.embed.orth_loss(self.orth_sample_v)
@@ -868,19 +871,30 @@ def load_tokens_hf(dataset: str, split: str,
 
 
 class TokenBuffer:
-    """Random (B, L+1) batches from a flat token array."""
+    """Sequential (B, L+1) batches for stateful training.
+    Partitions the flat token array into B contiguous segments."""
 
     def __init__(self, ids: List[int], seq_len: int, batch_size: int,
                  device: torch.device, seed: int = 42):
         self.ids  = torch.tensor(ids, dtype=torch.long, device=device)
         self.L    = seq_len
         self.B    = batch_size
-        self.rng  = torch.Generator(device="cpu").manual_seed(seed)
-        self.N    = max(len(ids) - seq_len - 1, 1)
+        self.N    = len(ids)
+        self.seg_len = self.N // batch_size
+        self.ptrs = [i * self.seg_len for i in range(batch_size)]
 
-    def next_batch(self) -> Tensor:
-        starts = torch.randint(0, self.N, (self.B,), generator=self.rng)
-        return torch.stack([self.ids[s: s + self.L + 1] for s in starts])
+    def next_batch(self) -> Tuple[Tensor, bool]:
+        """Return (batch, was_reset). was_reset is True if any pointer wrapped."""
+        chunks = []
+        any_reset = False
+        for i in range(self.B):
+            start = self.ptrs[i]
+            if start + self.L + 1 > (i + 1) * self.seg_len or start + self.L + 1 > self.N:
+                start = i * self.seg_len
+                any_reset = True
+            chunks.append(self.ids[start : start + self.L + 1])
+            self.ptrs[i] = start + self.L
+        return torch.stack(chunks), any_reset
 
 
 class StreamingBuffer:
@@ -919,19 +933,24 @@ class StreamingBuffer:
             if text:
                 self.buf.extend(encode(text + "\n"))
 
-    def next_batch(self) -> Tensor:
+    def next_batch(self) -> Tuple[Tensor, bool]:
         needed = (self.L + 1) * self.B
+        any_reset = False
         while len(self.buf) < needed:
             if self._exhausted:
-                raise RuntimeError(
-                    f"StreamingBuffer: dataset exhausted ({len(self.buf)} tokens "
-                    f"remain, need {needed}). Use a larger dataset or reduce batch/seq_len."
-                )
+                any_reset = True
+                break
             self._fill()
-        chunk    = self.buf[:needed]
-        self.buf = self.buf[needed:]
-        t        = torch.tensor(chunk, dtype=torch.long, device=self.dev)
-        return t.view(self.B, self.L + 1)
+
+        if len(self.buf) < needed:
+             chunk = self.buf + [0] * (needed - len(self.buf))
+             self.buf = []
+        else:
+             chunk    = self.buf[:needed]
+             self.buf = self.buf[needed:]
+
+        t = torch.tensor(chunk, dtype=torch.long, device=self.dev)
+        return t.view(self.B, self.L + 1), any_reset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1059,7 +1078,7 @@ def evaluate(model: PIAModel, buf: TokenBuffer,
     model.eval()
     total = 0.0
     for _ in range(n_batches):
-        batch = buf.next_batch()
+        batch, _ = buf.next_batch()
         _, ce, _ = model.compute_loss(batch)
         total += ce.item()
     model.train()
@@ -1230,7 +1249,10 @@ def train(cfg: argparse.Namespace):
         # ── Micro-steps (gradient accumulation) ───────────────────────────
         total_ce = 0.0
         for _micro in range(accum):
-            batch        = train_buf.next_batch()
+            batch, was_reset = train_buf.next_batch()
+            if was_reset:
+                train_states = None
+
             tokens_seen += cfg.batch_size * cfg.seq_len
             steps_timer += 1
 
@@ -1243,8 +1265,6 @@ def train(cfg: argparse.Namespace):
                     batch, train_states)
 
             # Detach states — truncated BPTT.
-            # Slow band content and memory slots carry forward as VALUES only;
-            # gradients do not flow back through chunk boundaries.
             if train_states is not None:
                 train_states = [(h.detach(), M.detach(), pos)
                                 for h, M, pos in train_states]
