@@ -752,21 +752,31 @@ class PIAModel(nn.Module):
         return logits, new_states
 
     def compute_loss(self, ids: Tensor,
-                     states: Optional[State] = None
-                     ) -> Tuple[Tensor, Tensor, State]:
+                     states: Optional[State] = None,
+                     answer_pos: Optional[int] = None
+                     ) -> Tuple[Tensor, Tensor, Tensor, State]:
         # ids: (B, L+1). We use first L for input, last L for target.
-        # This ensures the state at the end of the chunk is perfectly aligned
-        # with the start of the next chunk in stateful training.
         logits, new_states = self.forward(ids[:, :-1], states)
         B, L, V = logits.shape
-        ce    = F.cross_entropy(
-            logits.reshape(-1, V),
-            ids[:, 1:].reshape(-1).long(),
-        )
+        targets = ids[:, 1:].long()
+
+        if answer_pos is not None:
+            # Masked loss: only compute CE at the specific answer position
+            # answer_pos is index into the sequence of length L
+            logit_pos = logits[:, answer_pos]   # (B, V)
+            target_pos = targets[:, answer_pos] # (B,)
+            ce = F.cross_entropy(logit_pos, target_pos)
+
+            # Accuracy at answer position
+            acc = (logit_pos.argmax(dim=-1) == target_pos).float().mean()
+        else:
+            ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+            acc = (logits.argmax(dim=-1) == targets).float().mean()
+
         orth  = (self.embed.orth_loss(self.orth_sample_v)
                  if self.orth_lam > 0 else ce.new_zeros(1))
         total = ce + self.orth_lam * orth
-        return total, ce, new_states
+        return total, ce, acc, new_states
 
     @property
     def n_params(self) -> int:
@@ -996,7 +1006,7 @@ class StreamingBuffer:
 
 class MetricLogger:
     ALL_COLS = [
-        "train_loss", "train_bpc", "train_ppl",
+        "train_loss", "ans_acc", "train_bpc", "train_ppl",
         "val_loss",   "val_bpc",   "val_ppl",
         "grad_norm",  "param_norm", "lr", "tok/s", "tokens",
     ]
@@ -1039,7 +1049,7 @@ class MetricLogger:
                 m[f"{prefix}_ppl"] = math.exp(min(m[lk], 20.0))
 
         parts = [f"step {step:>7,}"]
-        for k in ("train_loss", "train_bpc", "val_loss", "val_bpc",
+        for k in ("train_loss", "ans_acc", "train_bpc", "val_loss", "val_bpc",
                   "grad_norm", "lr", "tok/s", "tokens"):
             if k not in m:
                 continue
@@ -1110,13 +1120,13 @@ def make_optimizer(model: PIAModel, lr: float,
 
 @torch.no_grad()
 def evaluate(model: PIAModel, buf: TokenBuffer,
-             n_batches: int = 32) -> float:
+             n_batches: int = 32, answer_pos: Optional[int] = None) -> float:
     """Stateless evaluation — fresh state per batch."""
     model.eval()
     total = 0.0
     for _ in range(n_batches):
         batch, _ = buf.next_batch()
-        _, ce, _ = model.compute_loss(batch)
+        _, ce, _, _ = model.compute_loss(batch, answer_pos=answer_pos)
         total += ce.item()
     model.train()
     return total / n_batches
@@ -1286,7 +1296,7 @@ def train(cfg: argparse.Namespace):
             pg["lr"] = lr
 
         # ── Micro-steps (gradient accumulation) ───────────────────────────
-        total_ce = 0.0
+        total_ce, total_acc = 0.0, 0.0
         for _micro in range(accum):
             batch, was_reset = train_buf.next_batch()
             # If aligned, we always start from fresh state at position 0 of each batch
@@ -1298,11 +1308,11 @@ def train(cfg: argparse.Namespace):
 
             if use_amp:
                 with torch.amp.autocast(device_type=dev.type, dtype=amp_dtype):
-                    total_loss, ce_loss, train_states = model.compute_loss(
-                        batch, train_states)
+                    total_loss, ce_loss, acc, train_states = model.compute_loss(
+                        batch, train_states, answer_pos=cfg.answer_pos)
             else:
-                total_loss, ce_loss, train_states = model.compute_loss(
-                    batch, train_states)
+                total_loss, ce_loss, acc, train_states = model.compute_loss(
+                    batch, train_states, answer_pos=cfg.answer_pos)
 
             # Detach states — truncated BPTT.
             if train_states is not None:
@@ -1316,8 +1326,10 @@ def train(cfg: argparse.Namespace):
                 scaled.backward()
 
             total_ce += ce_loss.item()
+            total_acc += acc.item()
 
         avg_ce = total_ce / accum
+        avg_acc = total_acc / accum
 
         # ── Memory bank warmup freeze ──────────────────────────────────────
         # Zero MemoryBank grads for the first mem_warmup steps so the SSM
@@ -1340,7 +1352,7 @@ def train(cfg: argparse.Namespace):
             opt.step()
 
         opt.zero_grad(set_to_none=True)
-        logger.update(train_loss=avg_ce, grad_norm=grad_norm)
+        logger.update(train_loss=avg_ce, ans_acc=avg_acc, grad_norm=grad_norm)
 
         # ── Periodic log ─────────────────────────────────────────────────
         if step % cfg.log_every == 0:
@@ -1359,7 +1371,8 @@ def train(cfg: argparse.Namespace):
 
         # ── Validation ────────────────────────────────────────────────────
         if step % cfg.val_every == 0:
-            val_loss = evaluate(model, val_buf, n_batches=cfg.val_batches)
+            val_loss = evaluate(model, val_buf, n_batches=cfg.val_batches,
+                                answer_pos=cfg.answer_pos)
             val_bpc  = val_loss / math.log(2)
             val_ppl  = math.exp(min(val_loss, 20.0))
             print(f"  ┌ VAL step={step:,}  loss={val_loss:.4f}  "
@@ -1473,6 +1486,10 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--seq_len",         type=int,   default=256)
     p.add_argument("--seq_aligned",    action="store_true",
                    help="Start batches at document (newline) boundaries")
+    p.add_argument("--memorize",       action="store_true",
+                   help="Auto-set answer_pos to seq_len-1 for small tasks")
+    p.add_argument("--answer_pos",     type=int, default=None,
+                   help="Compute loss only at this token position (0 to seq_len-1)")
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--warmup",          type=int,   default=500)
     p.add_argument("--lr_decay_factor", type=float, default=0.1,
@@ -1526,6 +1543,10 @@ def get_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     cfg = get_parser().parse_args()
+
+    if cfg.memorize and cfg.answer_pos is None:
+        cfg.answer_pos = cfg.seq_len - 1
+        print(f"Memorize mode: auto-setting answer_pos to {cfg.answer_pos}")
 
     if cfg.device == "auto":
         if torch.cuda.is_available():
