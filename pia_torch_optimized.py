@@ -871,30 +871,67 @@ def load_tokens_hf(dataset: str, split: str,
 
 
 class TokenBuffer:
-    """Sequential (B, L+1) batches for stateful training.
-    Partitions the flat token array into B contiguous segments."""
+    """Manages training batches. Supports sequential or document-aligned modes."""
 
     def __init__(self, ids: List[int], seq_len: int, batch_size: int,
-                 device: torch.device, seed: int = 42):
-        self.ids  = torch.tensor(ids, dtype=torch.long, device=device)
-        self.L    = seq_len
-        self.B    = batch_size
-        self.N    = len(ids)
-        self.seg_len = self.N // batch_size
-        self.ptrs = [i * self.seg_len for i in range(batch_size)]
+                 device: torch.device, aligned: bool = False, seed: int = 42):
+        self.ids     = torch.tensor(ids, dtype=torch.long, device=device)
+        self.L       = seq_len
+        self.B       = batch_size
+        self.aligned = aligned
+        self.N       = len(ids)
+
+        if aligned:
+            # Document-aligned: split by newline (byte 10)
+            self.docs = []
+            current = []
+            for tid in ids:
+                current.append(tid)
+                if tid == 10: # \n
+                    if len(current) > 1:
+                        self.docs.append(current)
+                    current = []
+            if current:
+                self.docs.append(current)
+            self.doc_ptr = 0
+            self.N_docs  = len(self.docs)
+            print(f"TokenBuffer (aligned): {self.N_docs:,} documents")
+        else:
+            self.seg_len = self.N // batch_size
+            self.ptrs    = [i * self.seg_len for i in range(batch_size)]
 
     def next_batch(self) -> Tuple[Tensor, bool]:
-        """Return (batch, was_reset). was_reset is True if any pointer wrapped."""
-        chunks = []
-        any_reset = False
-        for i in range(self.B):
-            start = self.ptrs[i]
-            if start + self.L + 1 > (i + 1) * self.seg_len or start + self.L + 1 > self.N:
-                start = i * self.seg_len
-                any_reset = True
-            chunks.append(self.ids[start : start + self.L + 1])
-            self.ptrs[i] = start + self.L
-        return torch.stack(chunks), any_reset
+        """Return (batch, was_reset)."""
+        if self.aligned:
+            chunks = []
+            was_reset = False
+            for _ in range(self.B):
+                if self.doc_ptr >= self.N_docs:
+                    self.doc_ptr = 0
+                    was_reset = True
+
+                doc = self.docs[self.doc_ptr]
+                self.doc_ptr += 1
+
+                # Pad or truncate to seq_len + 1
+                chunk = doc[:self.L + 1]
+                if len(chunk) < self.L + 1:
+                    chunk = chunk + [0] * (self.L + 1 - len(chunk))
+                chunks.append(torch.tensor(chunk, dtype=torch.long, device=self.ids.device))
+            return torch.stack(chunks), was_reset
+
+        else:
+            # Sequential/Stateful
+            chunks = []
+            any_reset = False
+            for i in range(self.B):
+                start = self.ptrs[i]
+                if start + self.L + 1 > (i + 1) * self.seg_len or start + self.L + 1 > self.N:
+                    start = i * self.seg_len
+                    any_reset = True
+                chunks.append(self.ids[start : start + self.L + 1])
+                self.ptrs[i] = start + self.L
+            return torch.stack(chunks), any_reset
 
 
 class StreamingBuffer:
@@ -1207,8 +1244,10 @@ def train(cfg: argparse.Namespace):
         split   = int(len(train_ids) * 0.97)
         val_ids, train_ids = train_ids[split:], train_ids[:split]
 
-    train_buf = TokenBuffer(train_ids, cfg.seq_len, cfg.batch_size, dev)
-    val_buf   = TokenBuffer(val_ids,   cfg.seq_len, min(cfg.batch_size, 4), dev)
+    train_buf = TokenBuffer(train_ids, cfg.seq_len, cfg.batch_size, dev,
+                            aligned=cfg.seq_aligned)
+    val_buf   = TokenBuffer(val_ids,   cfg.seq_len, min(cfg.batch_size, 4), dev,
+                            aligned=cfg.seq_aligned)
 
     # ── Logging ───────────────────────────────────────────────────────────────
     logger   = MetricLogger(cfg.ckpt_dir,
@@ -1250,7 +1289,8 @@ def train(cfg: argparse.Namespace):
         total_ce = 0.0
         for _micro in range(accum):
             batch, was_reset = train_buf.next_batch()
-            if was_reset:
+            # If aligned, we always start from fresh state at position 0 of each batch
+            if cfg.seq_aligned or was_reset:
                 train_states = None
 
             tokens_seen += cfg.batch_size * cfg.seq_len
@@ -1431,6 +1471,8 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--steps",           type=int,   default=20_000)
     p.add_argument("--batch_size",      type=int,   default=8)
     p.add_argument("--seq_len",         type=int,   default=256)
+    p.add_argument("--seq_aligned",    action="store_true",
+                   help="Start batches at document (newline) boundaries")
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--warmup",          type=int,   default=500)
     p.add_argument("--lr_decay_factor", type=float, default=0.1,
