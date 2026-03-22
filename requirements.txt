@@ -1,5 +1,0 @@
-torch
-datasets
-transformers
-accelerate
-wandb
