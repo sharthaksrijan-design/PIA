@@ -1,7 +1,7 @@
 import numpy as np
 import time
-from data import load_clinc150, load_glove, build_embeddings, build_domain_structure, build_balanced_quads
-from model import PhaseEncoderV2, WhisperProtocolAttention
+from data import load_clinc150, load_glove, build_embeddings
+from model import PhaseEncoderV2, WhisperProtocolAttention, PhaseLLM
 from train import train
 
 def main():
@@ -26,7 +26,7 @@ def main():
 
     enc = PhaseEncoderV2(D, K, sampled=True, lr=2e-3)
 
-    # Train for 600 epochs
+    # Train
     trained_enc, W_cls = train(enc, train_embs, train_labels, val_embs, val_labels, N_INTENTS, K, D, epochs=600)
 
     # Eval
@@ -36,17 +36,15 @@ def main():
     test_acc = np.mean(test_preds == test_labels)
     print(f"Final Test Accuracy: {test_acc:.4f}")
 
-    # Demonstrate Whisper Protocol Attention
-    neighbor_map = trained_enc.get_neighbor_map()
-    whisper_att = WhisperProtocolAttention(K, D, neighbor_map=neighbor_map)
-
-    # Example: Attention with Whisper
-    Q = phi_test[:10]
-    K_ref = phi_test[10:20]
-    V = phi_test[20:30]
-    scores, final_V = whisper_att.compute_attention(Q, K_ref, V)
-    print("Whisper Protocol attention computed.")
-    print(f"Scores shape: {scores.shape}, Final V shape: {final_V.shape}")
+    # Demonstrate Hierarchical PhaseLLM and Whisper Protocol
+    print("\nDemonstrating PhaseLLM with Causal Whisper Attention...")
+    llm = PhaseLLM(D, K, n_layers=2)
+    # Add a sequence dimension for testing (B, L, D)
+    seq_E = test_embs[:5][None, :, :] # (1, 5, 100)
+    out_phi = llm.forward(seq_E, causal=True)
+    print(f"Input shape: {seq_E.shape}")
+    print(f"Output phase shape: {out_phi.shape}")
+    print("Hierarchical Forward pass complete.")
 
 if __name__ == "__main__":
     main()

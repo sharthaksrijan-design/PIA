@@ -1,38 +1,61 @@
 import numpy as np
 import time
-from model import Adam, PhaseEncoderV2
 
 def ce_forward_and_grads(E_b, labels, W_enc, omega, W_cls, K):
-    from scipy.special import expit as sigmoid
+    """
+    Revised CE for complex-valued Phase Encoder.
+    Using tanh of magnitude to gate the phase, preventing instability.
+    """
     B = len(E_b)
     Ed = E_b.astype(np.float64)
     z = Ed @ W_enc.T
-    sig = sigmoid(z)
-    phi = 2 * np.pi * sig * omega[None, :]
+    mag = np.abs(z) + 1e-12
+    # Gating the phase with normalized magnitude
+    gate = np.tanh(mag)
+    phi = np.angle(z) * omega[None, :] * gate
+
     logits = phi @ W_cls.T
     ex = np.exp(logits - logits.max(axis=1, keepdims=True))
     probs = ex / ex.sum(axis=1, keepdims=True)
     loss = -np.mean(np.log(probs[np.arange(B), labels] + 1e-12))
+
     delta = probs.copy()
     delta[np.arange(B), labels] -= 1.0
     delta /= B
-    grad_W_cls = delta.T @ phi
+
+    grad_W_cls = (delta.T @ phi).astype(np.float64)
     d_phi = delta @ W_cls
-    sp = sig * (1 - sig)
-    scale = 2 * np.pi * omega[None, :] * d_phi * sp
-    grad_W_enc = scale.T @ Ed
+
+    # Gradient of gated phase w.r.t z
+    # phi = angle(z) * omega * tanh(|z|)
+    # d_phi/d_z = [d_angle(z)/d_z * tanh(|z|) + angle(z) * d_tanh(|z|)/d_z] * omega
+    # d_angle(z)/d_z = i * z / (2 * |z|^2)
+    # d_tanh(|z|)/d_z = (1 - tanh(|z|)^2) * z / (2 * |z|)
+
+    d_angle = (1j * z / (2 * mag ** 2))
+    d_tanh = (1.0 - gate ** 2) * (z / (2 * mag))
+
+    grad_phi_z = (d_angle * gate + np.angle(z) * d_tanh) * omega[None, :]
+    grad_W_enc = (d_phi * grad_phi_z).T @ Ed
+
     return loss, grad_W_enc, grad_W_cls
 
 def train(enc, train_embs, train_labels, val_embs, val_labels,
           N_INTENTS, K, D, epochs=300, batch_size=256,
-          lam_ce=1.0, quads_pos=None, quads_neg=None):
+          lam_ce=1.0):
 
+    from model import Adam
     W_cls = np.random.randn(N_INTENTS, K).astype(np.float64) * 0.01
-    opt_cls = Adam((N_INTENTS, K), lr=5e-3)
+
+    class RealAdam(Adam):
+        def __init__(self, shape, lr=5e-3):
+            super().__init__(shape, lr)
+            self.m = self.m.real; self.v = self.v.real
+
+    opt_cls = RealAdam((N_INTENTS, K), lr=5e-3)
     opt_enc_ce = Adam((K, D), lr=2e-3)
 
     rng_batch = np.random.default_rng(42)
-    t0 = time.time()
     best_val_acc = 0.0
     best_weights = {}
 
@@ -48,9 +71,6 @@ def train(enc, train_embs, train_labels, val_embs, val_labels,
         enc.W -= opt_enc_ce.step(lam_ce * gW_enc)
         W_cls -= opt_cls.step(lam_ce * gW_cls)
 
-        # Geometric step
-        geo = enc.step(train_embs)
-
         if ep % 50 == 0 or ep == epochs:
             phi_val = enc.phi(val_embs.astype(np.float64)).astype(np.float32)
             val_logits = phi_val @ W_cls.T.astype(np.float32)
@@ -65,7 +85,7 @@ def train(enc, train_embs, train_labels, val_embs, val_labels,
                     'omega': enc.omega.copy(),
                     'ep': ep
                 }
-            print(f"  ep={ep:>3}  ce={ce_loss:.4f}  metric={geo['metric']:.4f}  val_acc={val_acc:.4f} {'*best' if val_acc == best_val_acc else ''}")
+            print(f"  ep={ep:>3}  ce={ce_loss:.4f}  val_acc={val_acc:.4f} {'*best' if val_acc == best_val_acc else ''}")
 
     print(f"Best val_acc={best_val_acc:.4f} at epoch {best_weights.get('ep')}")
     enc.W = best_weights['W_enc']
