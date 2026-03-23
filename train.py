@@ -39,7 +39,7 @@ def ce_forward_and_grads(E_b, labels, W_enc, omega, W_cls, b_cls, W_hid, b_hid, 
     return loss, grad_W_enc, grad_W_hid, grad_b_hid, grad_W_cls, grad_b_cls
 
 def train(enc, train_embs, train_labels, val_embs, val_labels,
-          N_INTENTS, K, D, epochs=2000, batch_size=256):
+          N_INTENTS, K, D, epochs=600, batch_size=256):
 
     from model import Adam
     H = 1024
@@ -54,22 +54,26 @@ def train(enc, train_embs, train_labels, val_embs, val_labels,
             super().__init__(shape, lr)
             self.m = self.m.real; self.v = self.v.real
 
-    opt_enc = Adam((K, D), lr=1e-3) # Smaller learning rate for encoder stability
-    opt_hid = RealAdam((H, K), lr=1e-3)
-    opt_b_hid = RealAdam((H,), lr=1e-3)
-    opt_cls = RealAdam((N_INTENTS, H), lr=1e-3)
-    opt_b_cls = RealAdam((N_INTENTS,), lr=1e-3)
+    opt_enc = Adam((K, D), lr=5e-3)
+    opt_hid = RealAdam((H, K), lr=1e-2)
+    opt_b_hid = RealAdam((H,), lr=1e-2)
+    opt_cls = RealAdam((N_INTENTS, H), lr=1e-2)
+    opt_b_cls = RealAdam((N_INTENTS,), lr=1e-2)
 
     rng_batch = np.random.default_rng(42)
     best_val_acc = 0.0
     best_weights = {}
 
-    print(f"Targeting 97% Accuracy. Training {epochs} epochs...")
+    print(f"Advanced Whisper Protocol Training. {epochs} epochs...")
 
     for ep in range(1, epochs + 1):
         idx = rng_batch.choice(len(train_embs), batch_size, replace=False)
         E_b = train_embs[idx]
         labs = train_labels[idx]
+
+        # Note: In this version, we optimize the base encoder and head jointly.
+        # Dynamic Gating and Recursive Attention are utilized in PhaseLLM inference.
+        # Future work: Backprop through the recursive steps for full joint optimization.
 
         loss, gW_enc, gW_hid, gb_hid, gW_cls, gb_cls = ce_forward_and_grads(
             E_b, labs, enc.W, enc.omega, W_cls, b_cls, W_hid, b_hid, K)
@@ -80,14 +84,14 @@ def train(enc, train_embs, train_labels, val_embs, val_labels,
         W_cls -= opt_cls.step(gW_cls)
         b_cls -= opt_b_cls.step(gb_cls)
 
-        if ep % 500 == 0:
+        if ep % 200 == 0:
             opt_enc.lr *= 0.5
             opt_hid.lr *= 0.5
             opt_b_hid.lr *= 0.5
             opt_cls.lr *= 0.5
             opt_b_cls.lr *= 0.5
 
-        if ep % 100 == 0 or ep == epochs:
+        if ep % 50 == 0 or ep == epochs:
             phi_val = enc.phi(val_embs.astype(np.float64))
             h = phi_val @ W_hid.T + b_hid[None, :]
             val_logits = np.maximum(0, h) @ W_cls.T + b_cls[None, :]

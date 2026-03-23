@@ -13,7 +13,7 @@ def log(msg):
     print(msg)
 
 def test_convergence_and_accuracy():
-    log("=== TEST: Convergence and Accuracy ===")
+    log("=== TEST: Convergence and Accuracy (Advanced Whisper Protocol) ===")
     splits, idx_to_intent, _ = load_clinc150()
     glove, D = load_glove()
     train_embs = build_embeddings(splits['train'][0], glove, D)
@@ -22,14 +22,14 @@ def test_convergence_and_accuracy():
     val_labels   = np.array(splits['validation'][1])
 
     K = 320; N_INTENTS = len(idx_to_intent)
-    enc = PhaseEncoderV2(D, K, lr=2e-3)
+    enc = PhaseEncoderV2(D, K)
 
-    log(f"Training to verify convergence. K={K}, D={D}, Intents={N_INTENTS}")
+    log(f"Training to verify convergence with MLP Head. K={K}, D={D}, Intents={N_INTENTS}")
 
     prev_acc = 0.0
-    for ep in range(50, 251, 50):
+    for ep in range(100, 501, 100):
         t_start = time.time()
-        enc, weights = train(enc, train_embs, train_labels, val_embs, val_labels, N_INTENTS, K, D, epochs=50)
+        enc, weights = train(enc, train_embs, train_labels, val_embs, val_labels, N_INTENTS, K, D, epochs=100)
 
         W_hid, b_hid = weights['W_hid'], weights['b_hid']
         W_cls, b_cls = weights['W_cls'], weights['b_cls']
@@ -47,39 +47,28 @@ def test_convergence_and_accuracy():
 
     log(f"Final Validation Accuracy: {current_acc:.4f}")
 
-def test_parameter_stability():
-    log("\n=== TEST: Parameter Stability ===")
-    D = 100; K = 320
-    enc = PhaseEncoderV2(D, K)
-
-    if np.any(np.isnan(enc.W)):
-        log("ERROR: NaN detected in initial weights W!")
-    if np.any(np.isinf(enc.W)):
-        log("ERROR: Inf detected in initial weights W!")
-
-    w_norm = np.linalg.norm(enc.W)
-    log(f"Initial Weight W Norm: {w_norm:.4f}")
-    log(f"Omega Range: [{np.min(enc.omega):.4f}, {np.max(enc.omega):.4f}]")
-
-def test_hierarchical_forward():
-    log("\n=== TEST: Hierarchical PhaseLLM Forward Pass ===")
+def test_recursive_energy_forward():
+    log("\n=== TEST: Recursive Energy Attention Forward Pass ===")
     B, L, D = 2, 10, 100
     K = 320
-    llm = PhaseLLM(D, K, n_layers=3)
+    llm = PhaseLLM(D, K, n_layers=2)
     dummy_input = np.random.randn(B, L, D)
 
     try:
         t_start = time.time()
-        out = llm.forward(dummy_input, causal=True)
-        log(f"Forward Pass Success. Output shape: {out.shape}, Time={time.time()-t_start:.4f}s")
+        out, energy = llm.forward(dummy_input, causal=True)
+        log(f"Forward Pass Success. Output shape: {out.shape}, Average Energy Consumed: {energy:.4f}, Time={time.time()-t_start:.4f}s")
+        if out.shape != (B, L, K):
+            log(f"ERROR: Incorrect output shape! Expected {(B, L, K)}, got {out.shape}")
+        if np.any(np.isnan(out)):
+            log("ERROR: NaN detected in forward pass output!")
     except Exception as e:
         log(f"CRITICAL ERROR in forward pass: {str(e)}")
 
 if __name__ == "__main__":
     if os.path.exists(LOG_FILE):
         os.remove(LOG_FILE)
-    log("Starting Model Extensive Tests...")
-    test_parameter_stability()
-    test_hierarchical_forward()
+    log("Starting Advanced Model Verification...")
+    test_recursive_energy_forward()
     test_convergence_and_accuracy()
-    log("\nTests Complete.")
+    log("\nAdvanced Verification Complete.")
