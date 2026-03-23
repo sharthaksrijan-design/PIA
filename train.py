@@ -5,12 +5,12 @@ def ce_forward_and_grads(E_b, labels, W_enc, omega, W_cls, K):
     """
     Revised CE for complex-valued Phase Encoder.
     Using tanh of magnitude to gate the phase, preventing instability.
+    Includes proper chain rule for angle and magnitude.
     """
     B = len(E_b)
     Ed = E_b.astype(np.float64)
     z = Ed @ W_enc.T
     mag = np.abs(z) + 1e-12
-    # Gating the phase with normalized magnitude
     gate = np.tanh(mag)
     phi = np.angle(z) * omega[None, :] * gate
 
@@ -26,16 +26,16 @@ def ce_forward_and_grads(E_b, labels, W_enc, omega, W_cls, K):
     grad_W_cls = (delta.T @ phi).astype(np.float64)
     d_phi = delta @ W_cls
 
-    # Gradient of gated phase w.r.t z
     # phi = angle(z) * omega * tanh(|z|)
-    # d_phi/d_z = [d_angle(z)/d_z * tanh(|z|) + angle(z) * d_tanh(|z|)/d_z] * omega
-    # d_angle(z)/d_z = i * z / (2 * |z|^2)
-    # d_tanh(|z|)/d_z = (1 - tanh(|z|)^2) * z / (2 * |z|)
+    # grad_phi_z = (d_angle * gate + np.angle(z) * d_tanh) * omega
+    # d_angle = (1j * z / (2 * mag ** 2))
+    # d_tanh = (1.0 - gate ** 2) * (z / (2 * mag))
 
     d_angle = (1j * z / (2 * mag ** 2))
     d_tanh = (1.0 - gate ** 2) * (z / (2 * mag))
 
     grad_phi_z = (d_angle * gate + np.angle(z) * d_tanh) * omega[None, :]
+    # (B, K) * (B, K) -> (B, K). Then (K, B) @ (B, D) -> (K, D)
     grad_W_enc = (d_phi * grad_phi_z).T @ Ed
 
     return loss, grad_W_enc, grad_W_cls
@@ -45,14 +45,15 @@ def train(enc, train_embs, train_labels, val_embs, val_labels,
           lam_ce=1.0):
 
     from model import Adam
-    W_cls = np.random.randn(N_INTENTS, K).astype(np.float64) * 0.01
+    # Initialize W_cls with proper variance
+    W_cls = (np.random.randn(N_INTENTS, K) * np.sqrt(1.0 / K)).astype(np.float64)
 
     class RealAdam(Adam):
         def __init__(self, shape, lr=5e-3):
             super().__init__(shape, lr)
             self.m = self.m.real; self.v = self.v.real
 
-    opt_cls = RealAdam((N_INTENTS, K), lr=5e-3)
+    opt_cls = RealAdam((N_INTENTS, K), lr=1e-2)
     opt_enc_ce = Adam((K, D), lr=2e-3)
 
     rng_batch = np.random.default_rng(42)

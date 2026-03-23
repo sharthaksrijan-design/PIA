@@ -31,14 +31,21 @@ class WhisperProtocolAttention:
         Q, K, V: (B, L, K)
         mask: (L, L) causal mask if provided
         """
+        # Ensure 3D (B, L, K)
+        if len(Q_phase.shape) == 2:
+            Q_phase = Q_phase[:, None, :]
+            K_phase = K_phase[:, None, :]
+            V_phase = V_phase[:, None, :]
+
         B, L, K = Q_phase.shape
 
-        # 1. Match own phase to query
+        # 1. Match own phase to query (Individual Oscillator Match)
         diff = Q_phase - K_phase
         confidence = np.cos(diff) # (B, L, K)
 
         final_V = V_phase.copy()
 
+        # 2 steps of whispering
         for _ in range(2):
             next_V = final_V.copy()
             if self.neighbor_map:
@@ -52,6 +59,7 @@ class WhisperProtocolAttention:
             final_V = next_V
 
         # 2. Causal Dot-Product Attention (Phase-based)
+        # Reshape to (B, K, L, 1) and (B, K, 1, L)
         Q_p = Q_phase.transpose(0, 2, 1)[:, :, :, None]
         K_p = K_phase.transpose(0, 2, 1)[:, :, None, :]
 
@@ -78,7 +86,10 @@ class PhaseEncoderV2:
         self.lam_metric = lam_metric
 
         rng = np.random.default_rng(seed)
-        r = rng.standard_normal((K, D)) * 0.1
+        # Complex initialization: Rayleigh magnitude, Uniform phase
+        # Rayleigh scale for complex variance of 1/D: scale = sqrt(1 / (2*D))
+        scale = np.sqrt(1.0 / (2.0 * D))
+        r = rng.rayleigh(scale, (K, D))
         theta = rng.uniform(-np.pi, np.pi, (K, D))
         self.W = (r * np.exp(1j * theta)).astype(np.complex128)
         self.opt = Adam((K, D), lr=lr)
@@ -112,8 +123,7 @@ class PhaseEncoderV2:
 
 class PhaseLLM:
     """
-    Hierarchical Phase Model (Stacked Layers).
-    Each layer refines the semantic phase of the sequence.
+    Hierarchical Phase Model with Residual Connections.
     """
     def __init__(self, D, K, n_layers=3, seed=42):
         self.layers = []
@@ -121,7 +131,6 @@ class PhaseLLM:
         for i in range(n_layers):
             in_dim = D if i == 0 else K
             self.layers.append(PhaseEncoderV2(in_dim, K, seed=seed+i))
-            # Every layer has neighborhood-aware attention
             self.attentions.append(WhisperProtocolAttention(K, K))
 
     def forward(self, E, causal=True):
@@ -131,8 +140,14 @@ class PhaseLLM:
 
         for i in range(len(self.layers)):
             # Encoder projection
-            x = self.layers[i].phi(x)
-            # Neighborhood-aware attention (routing/refinement)
+            p = self.layers[i].phi(x)
+            # Neighborhood-aware attention
             self.attentions[i].neighbor_map = self.layers[i].get_neighbor_map()
-            x = self.attentions[i].compute_attention(x, x, x, mask=mask)
+            p = self.attentions[i].compute_attention(p, p, p, mask=mask)
+
+            # Residual connection (only if dimensions match)
+            if x.shape == p.shape:
+                x = x + p
+            else:
+                x = p # Transition from D to K
         return x
