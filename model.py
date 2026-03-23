@@ -16,26 +16,22 @@ class Adam:
         v_hat  = self.v / (1 - self.b2 ** self.t)
         return self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
-class DynamicNeighborhoodGating:
+def hillis_steele_scan(x):
     """
-    Learnable gating mechanism to determine whisper-routing based on query context.
+    Hillis-Steele inclusive parallel scan for fast O(log L) prefix sums.
     """
-    def __init__(self, D, K, seed=42):
-        rng = np.random.default_rng(seed)
-        self.W_gate1 = rng.standard_normal((K, D)) * np.sqrt(1.0 / D)
-
-    def get_routing(self, E):
-        shape = E.shape
-        E_flat = E.reshape(-1, shape[-1])
-        h = E_flat @ self.W_gate1.T
-        h = h.reshape(*shape[:-1], -1)
-        # Use simple fixed neighborhood if gating not trained
-        return None
+    B, L, K = x.shape
+    num_steps = int(np.ceil(np.log2(L)))
+    res = x.copy()
+    for i in range(num_steps):
+        stride = 2**i
+        if stride >= L: break
+        shifted = np.zeros_like(res)
+        shifted[:, stride:, :] = res[:, :-stride, :]
+        res = res + shifted
+    return res
 
 class RecursiveEnergyAttention:
-    """
-    Whisper Protocol with Energy-Based Routing and Recursive Whispering.
-    """
     def __init__(self, K, D, confidence_threshold=0.85, energy_budget=1.0, whisper_cost=0.1):
         self.K = K
         self.D = D
@@ -43,13 +39,19 @@ class RecursiveEnergyAttention:
         self.energy_budget = energy_budget
         self.whisper_cost = whisper_cost
 
-    def compute_attention(self, Q_phase, K_phase, V_phase, routing_gate=None, mask=None, neighbor_map=None):
+    def compute_attention(self, Q_phase, K_phase, V_phase, mask=None, neighbor_map=None, gpc=None):
         if len(Q_phase.shape) == 2:
             Q_phase = Q_phase[:, None, :]
             K_phase = K_phase[:, None, :]
             V_phase = V_phase[:, None, :]
 
         B, L, K = Q_phase.shape
+
+        # Integrate Global Phase Context (GPC) if provided
+        if gpc is not None:
+            # gpc: (B, 1, K) summary of the sequence
+            Q_phase = Q_phase + 0.1 * gpc
+
         diff = Q_phase - K_phase
         confidence = np.cos(diff)
 
@@ -57,15 +59,11 @@ class RecursiveEnergyAttention:
         total_energy_consumed = np.zeros((B, L))
         current_energy = np.full((B, L), self.energy_budget)
 
-        for step in range(5):
+        for step in range(3):
             need_whisper = (confidence < self.confidence_threshold) & (current_energy[..., None] >= self.whisper_cost)
             if not np.any(need_whisper):
                 break
-
-            if routing_gate is not None:
-                whispered_V = np.matmul(routing_gate, final_V[..., None]).squeeze(-1)
-            elif neighbor_map is not None:
-                # Use static neighbor map for recursive whispering
+            if neighbor_map is not None:
                 whispered_V = final_V.copy()
                 for k in range(self.K):
                     neighs = neighbor_map.get(k, [])
@@ -73,7 +71,6 @@ class RecursiveEnergyAttention:
                         whispered_V[:, :, k] = np.mean(final_V[:, :, neighs], axis=2)
             else:
                 break
-
             mask_update = need_whisper.astype(float)
             final_V = (1 - mask_update) * final_V + mask_update * whispered_V
             confidence = (1 - mask_update) * confidence + mask_update * (confidence + 0.05)
@@ -130,17 +127,28 @@ class PhaseLLM:
             self.layers.append(PhaseEncoderV2(in_dim, K, seed=seed+i))
             self.attentions.append(RecursiveEnergyAttention(K, K))
 
-    def forward(self, E, causal=True):
+    def forward(self, E, causal=True, use_scan=True):
         x = E
-        L = x.shape[1] if len(x.shape) == 3 else 1
+        if len(x.shape) == 2:
+            x = x[:, None, :]
+
+        B, L, _ = x.shape
         mask = np.triu(np.ones((L, L)), k=1) if causal and L > 1 else None
 
         total_energy = 0
         for i in range(len(self.layers)):
             p = self.layers[i].phi(x)
+
+            # Global Phase Context (GPC): Mean phase of current layer
+            gpc = np.mean(p, axis=1, keepdims=True) # (B, 1, K)
+
+            if use_scan and L > 1:
+                p = hillis_steele_scan(p)
+
             n_map = self.layers[i].get_neighbor_map()
-            p, energy = self.attentions[i].compute_attention(p, p, p, mask=mask, neighbor_map=n_map)
+            p, energy = self.attentions[i].compute_attention(p, p, p, mask=mask, neighbor_map=n_map, gpc=gpc)
             total_energy += np.mean(energy)
+
             if x.shape == p.shape:
                 x = 0.5 * x + 0.5 * p
             else:
