@@ -17,38 +17,27 @@ class Adam:
         return self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 class WhisperProtocolAttention:
-    """
-    Implements individual oscillator matching logic with CAUSAL MASKING.
-    """
-    def __init__(self, K, D, neighbor_map=None, confidence_threshold=0.8):
+    def __init__(self, K, D, neighbor_map=None, confidence_threshold=0.85):
         self.K = K
         self.D = D
         self.neighbor_map = neighbor_map
         self.confidence_threshold = confidence_threshold
 
     def compute_attention(self, Q_phase, K_phase, V_phase, mask=None):
-        """
-        Q, K, V: (B, L, K)
-        mask: (L, L) causal mask if provided
-        """
-        # Ensure 3D (B, L, K)
         if len(Q_phase.shape) == 2:
             Q_phase = Q_phase[:, None, :]
             K_phase = K_phase[:, None, :]
             V_phase = V_phase[:, None, :]
 
         B, L, K = Q_phase.shape
-
-        # 1. Match own phase to query (Individual Oscillator Match)
         diff = Q_phase - K_phase
-        confidence = np.cos(diff) # (B, L, K)
+        confidence = np.cos(diff)
 
         final_V = V_phase.copy()
 
-        # 2 steps of whispering
-        for _ in range(2):
-            next_V = final_V.copy()
-            if self.neighbor_map:
+        if self.neighbor_map:
+            for _ in range(3):
+                next_V = final_V.copy()
                 for k in range(self.K):
                     low_conf_mask = confidence[:, :, k] < self.confidence_threshold
                     if np.any(low_conf_mask):
@@ -56,15 +45,12 @@ class WhisperProtocolAttention:
                         if neighbors:
                             avg_neighbor_v = np.mean(final_V[:, :, neighbors], axis=2)
                             next_V[low_conf_mask, k] = avg_neighbor_v[low_conf_mask]
-            final_V = next_V
+                final_V = next_V
 
-        # 2. Causal Dot-Product Attention (Phase-based)
-        # Reshape to (B, K, L, 1) and (B, K, 1, L)
         Q_p = Q_phase.transpose(0, 2, 1)[:, :, :, None]
         K_p = K_phase.transpose(0, 2, 1)[:, :, None, :]
 
         attn_logits = np.cos(Q_p - K_p)
-
         if mask is not None:
             attn_logits = attn_logits + (mask[None, None, :, :] * -1e9)
 
@@ -86,16 +72,14 @@ class PhaseEncoderV2:
         self.lam_metric = lam_metric
 
         rng = np.random.default_rng(seed)
-        # Complex initialization: Rayleigh magnitude, Uniform phase
-        # Rayleigh scale for complex variance of 1/D: scale = sqrt(1 / (2*D))
-        scale = np.sqrt(1.0 / (2.0 * D))
-        r = rng.rayleigh(scale, (K, D))
+        std = np.sqrt(2.0 / (D + K))
+        r = rng.rayleigh(std / np.sqrt(2), (K, D))
         theta = rng.uniform(-np.pi, np.pi, (K, D))
         self.W = (r * np.exp(1j * theta)).astype(np.complex128)
         self.opt = Adam((K, D), lr=lr)
 
         if freq_bands:
-            self.omega = np.exp(rng.uniform(np.log(0.5), np.log(2.0), K)).astype(np.float64)
+            self.omega = np.exp(rng.uniform(np.log(0.25), np.log(4.0), K)).astype(np.float64)
             if self.train_omega:
                 self.opt_omega = Adam((K,), lr=lr * 0.1)
         else:
@@ -117,14 +101,11 @@ class PhaseEncoderV2:
         sim = np.abs(W_norm @ W_norm.conj().T)
         neighbor_map = {}
         for k in range(self.K):
-            idxs = np.argsort(-sim[k])[:6]
+            idxs = np.argsort(-sim[k])[:8]
             neighbor_map[k] = [i for i in idxs if i != k]
         return neighbor_map
 
 class PhaseLLM:
-    """
-    Hierarchical Phase Model with Residual Connections.
-    """
     def __init__(self, D, K, n_layers=3, seed=42):
         self.layers = []
         self.attentions = []
@@ -139,15 +120,12 @@ class PhaseLLM:
         mask = np.triu(np.ones((L, L)), k=1) if causal and L > 1 else None
 
         for i in range(len(self.layers)):
-            # Encoder projection
             p = self.layers[i].phi(x)
-            # Neighborhood-aware attention
             self.attentions[i].neighbor_map = self.layers[i].get_neighbor_map()
             p = self.attentions[i].compute_attention(p, p, p, mask=mask)
-
-            # Residual connection (only if dimensions match)
             if x.shape == p.shape:
-                x = x + p
+                # Gated skip connection
+                x = 0.5 * x + 0.5 * p
             else:
-                x = p # Transition from D to K
+                x = p
         return x

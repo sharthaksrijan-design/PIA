@@ -22,29 +22,32 @@ def main():
     test_embs  = build_embeddings(test_texts,  glove, D)
 
     N_INTENTS = len(idx_to_intent)
-    K = 320
+    K = 512 # Increased oscillator count
 
-    enc = PhaseEncoderV2(D, K, sampled=True, lr=2e-3)
+    enc = PhaseEncoderV2(D, K, sampled=True, lr=5e-3)
 
-    # Train
-    trained_enc, W_cls = train(enc, train_embs, train_labels, val_embs, val_labels, N_INTENTS, K, D, epochs=600)
+    # Train for 1500 epochs with upgraded MLP head
+    trained_enc, best_weights = train(enc, train_embs, train_labels, val_embs, val_labels, N_INTENTS, K, D, epochs=1500)
 
     # Eval
-    phi_test = trained_enc.phi(test_embs.astype(np.float64)).astype(np.float32)
-    test_logits = phi_test @ W_cls.T.astype(np.float32)
+    W_hid = best_weights['W_hid']
+    b_hid = best_weights['b_hid']
+    W_cls = best_weights['W_cls']
+    b_cls = best_weights['b_cls']
+
+    phi_test = trained_enc.phi(test_embs.astype(np.float64))
+    h = phi_test @ W_hid.T + b_hid[None, :]
+    test_logits = np.maximum(0, h) @ W_cls.T + b_cls[None, :]
     test_preds = np.argmax(test_logits, axis=1)
     test_acc = np.mean(test_preds == test_labels)
     print(f"Final Test Accuracy: {test_acc:.4f}")
 
-    # Demonstrate Hierarchical PhaseLLM and Whisper Protocol
+    # Demonstrate Hierarchical PhaseLLM
     print("\nDemonstrating PhaseLLM with Causal Whisper Attention...")
     llm = PhaseLLM(D, K, n_layers=2)
-    # Add a sequence dimension for testing (B, L, D)
-    seq_E = test_embs[:5][None, :, :] # (1, 5, 100)
+    seq_E = test_embs[:5][None, :, :]
     out_phi = llm.forward(seq_E, causal=True)
-    print(f"Input shape: {seq_E.shape}")
     print(f"Output phase shape: {out_phi.shape}")
-    print("Hierarchical Forward pass complete.")
 
 if __name__ == "__main__":
     main()
