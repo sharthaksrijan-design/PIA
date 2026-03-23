@@ -15,9 +15,7 @@ class Adam:
         return self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 def hillis_steele_scan(x):
-    B, L, K = x.shape
-    num_steps = int(np.ceil(np.log2(L)))
-    res = x.copy()
+    B, L, K = x.shape; num_steps = int(np.ceil(np.log2(L))); res = x.copy()
     for i in range(num_steps):
         stride = 2**i
         if stride >= L: break
@@ -39,32 +37,54 @@ class HippocampalMemoryBank:
         limit = self.capacity if self.is_full else self.ptr
         if limit == 0: return np.zeros_like(query_phase)
         curr = self.memory[:limit]; q_flat = query_phase.reshape(-1, K)
+        # Cosine coherence
         sim = np.cos(q_flat[:, None, :] - curr[None, :, :])
         coh = np.mean(sim, axis=-1); w = np.exp(coh * 5.0)
         w /= (np.sum(w, axis=-1, keepdims=True) + 1e-12)
         return (w @ curr).reshape(B, L, K)
 
 class RecursiveEnergyAttention:
+    """
+    Advanced Whisper Protocol with Multi-Hop Reasoning.
+    Allows multi-step interactions with memory and neighbors.
+    """
     def __init__(self, K, D, confidence_threshold=0.85, energy_budget=1.0, whisper_cost=0.1):
         self.K = K; self.D = D; self.confidence_threshold = confidence_threshold
         self.energy_budget = energy_budget; self.whisper_cost = whisper_cost
-    def compute_attention(self, Q_p, K_p, V_p, mask=None, neighbor_map=None, gpc=None, mem=None):
+
+    def compute_attention(self, Q_p, K_p, V_p, mask=None, neighbor_map=None, gpc=None, memory_bank=None):
         if len(Q_p.shape) == 2: Q_p, K_p, V_p = Q_p[:, None, :], K_p[:, None, :], V_p[:, None, :]
         B, L, K = Q_p.shape
         if gpc is not None: Q_p = Q_p + 0.05 * gpc
-        if mem is not None: Q_p = Q_p + 0.05 * mem
-        conf = np.cos(Q_p - K_p); fV = V_p.copy(); energy = np.zeros((B, L)); curr_e = np.full((B, L), self.energy_budget)
-        for _ in range(3):
+
+        fV = V_p.copy(); energy = np.zeros((B, L)); curr_e = np.full((B, L), self.energy_budget)
+
+        # Recursive multi-hop loop
+        for step in range(5):
+            conf = np.cos(Q_p - K_p)
             need = (conf < self.confidence_threshold) & (curr_e[..., None] >= self.whisper_cost)
             if not np.any(need): break
+
+            # Step 1: Query Neighbors (Whisper)
+            wV = fV.copy()
             if neighbor_map:
-                wV = fV.copy()
                 for k in range(self.K):
                     n = neighbor_map.get(k, [])
                     if n: wV[:, :, k] = np.mean(fV[:, :, n], axis=2)
-                mU = need.astype(float); fV = (1-mU)*fV + mU*wV; conf = (1-mU)*conf + mU*(conf+0.05)
-                consumed = np.any(need, axis=-1).astype(float) * self.whisper_cost
-                curr_e -= consumed; energy += consumed
+
+            # Step 2: Query Memory (Reasoning Hop)
+            if memory_bank:
+                # Use current hidden state as query for memory retrieval
+                mem_hop = memory_bank.read(Q_p)
+                # Chain reasoning: Update query phase based on memory content
+                Q_p = Q_p + 0.1 * mem_hop
+
+            # Update state
+            mU = need.astype(float); fV = (1-mU)*fV + mU*wV
+            consumed = np.any(need, axis=-1).astype(float) * self.whisper_cost
+            curr_e -= consumed; energy += consumed
+
+        # Final Causal Attention
         Q, K = Q_p.transpose(0,2,1)[:,:,:,None], K_p.transpose(0,2,1)[:,:,None,:]
         logits = np.cos(Q-K)
         if mask is not None: logits += (mask[None,None,:,:] * -1e9)
@@ -79,9 +99,21 @@ class PhaseEncoderV2:
         std = np.sqrt(2.0 / (D + K)); r = rng.rayleigh(std / np.sqrt(2), (K, D))
         th = rng.uniform(-np.pi, np.pi, (K, D)); self.W = (r * np.exp(1j * th)).astype(np.complex128)
         self.opt = Adam((K, D), lr=lr); self.omega = np.exp(rng.uniform(np.log(0.25), np.log(4.0), K)).astype(np.float64)
-    def phi(self, E):
+
+    def phi(self, E, stochastic=False, dropout_rate=0.1):
+        """
+        Phase projection with optional stochasticity for generalization.
+        """
         z = E @ self.W.T; mag = np.abs(z) + 1e-12; gate = np.tanh(mag)
-        return np.angle(z) * self.omega[None, ...] * gate
+        phase = np.angle(z) * self.omega[None, ...] * gate
+
+        if stochastic:
+            # Phase-Dropout: Zero out random oscillator phases
+            mask = np.random.binomial(1, 1 - dropout_rate, phase.shape)
+            phase = phase * mask
+
+        return phase
+
     def get_neighbor_map(self):
         W_n = self.W / (np.linalg.norm(self.W, axis=1, keepdims=True) + 1e-12)
         sim = np.abs(W_n @ W_n.conj().T); neighbor_map = {}
@@ -97,15 +129,21 @@ class PhaseLLM:
             self.layers.append(PhaseEncoderV2(in_dim, K, seed=seed+i))
             self.attentions.append(RecursiveEnergyAttention(K, K))
             self.memory_banks.append(HippocampalMemoryBank(K))
-    def forward(self, E, causal=True, use_scan=True, update_memory=True):
+
+    def forward(self, E, causal=True, use_scan=True, update_memory=True, stochastic=False):
         x = E if len(E.shape) == 3 else E[:, None, :]
         L = x.shape[1]; mask = np.triu(np.ones((L, L)), k=1) if causal and L > 1 else None
         total_e = 0
         for i in range(len(self.layers)):
-            p = self.layers[i].phi(x); gpc = np.mean(p, axis=1, keepdims=True); mem = self.memory_banks[i].read(p)
+            p = self.layers[i].phi(x, stochastic=stochastic)
+            gpc = np.mean(p, axis=1, keepdims=True)
             if use_scan and L > 1: p = hillis_steele_scan(p)
             n_map = self.layers[i].get_neighbor_map()
-            p, e = self.attentions[i].compute_attention(p, p, p, mask=mask, neighbor_map=n_map, gpc=gpc, mem=mem)
+
+            # Interactive Multi-Hop Reasoning Pass
+            p, e = self.attentions[i].compute_attention(
+                p, p, p, mask=mask, neighbor_map=n_map, gpc=gpc, memory_bank=self.memory_banks[i])
+
             if update_memory: self.memory_banks[i].write(p)
             total_e += np.mean(e)
             x = 0.5 * x + 0.5 * p if x.shape == p.shape else p
